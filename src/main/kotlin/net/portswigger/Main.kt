@@ -83,6 +83,10 @@ fun normalizeMcpUrl(value: String): String {
 }
 
 fun main(args: Array<String>) {
+    // kotlin-logging defaults to printing an initialization banner to stdout. Any non-JSON
+    // output corrupts the MCP stdio stream, so force the library's startup message off.
+    System.setProperty("kotlin-logging.logStartupMessage", "false")
+
     if (args.any { it == "-h" || it == "--help" }) {
         println(usage)
         return
