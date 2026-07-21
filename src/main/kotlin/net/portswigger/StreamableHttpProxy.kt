@@ -52,6 +52,7 @@ private const val MAX_CONCURRENT_UPSTREAM_REQUESTS = 16
 private const val REQUEST_QUEUE_CAPACITY = 64
 private const val CONTROL_QUEUE_CAPACITY = 64
 private const val HANDSHAKE_QUEUE_CAPACITY = 2
+private const val PROXY_OVERLOADED_ERROR_CODE = -32000
 private val EVENT_STREAM_WARMUP_DELAY = 250.milliseconds
 private val RETRYABLE_AVAILABILITY_STATUS_CODES = setOf(404, 408, 425, 429, 500, 502, 503, 504)
 
@@ -159,7 +160,19 @@ internal class StreamableHttpProxy(
         when {
             message is JSONRPCRequest && message.method == INITIALIZE_METHOD -> handshakeMessages.send(message)
             message is JSONRPCNotification && message.method == INITIALIZED_METHOD -> handshakeMessages.send(message)
-            message is JSONRPCRequest -> requestMessages.send(message)
+            message is JSONRPCRequest -> {
+                if (requestMessages.trySend(message).isFailure && !closed.get()) {
+                    stdioTransport.send(
+                        JSONRPCError(
+                            id = message.id,
+                            error = RPCError(
+                                code = PROXY_OVERLOADED_ERROR_CODE,
+                                message = "Burp MCP proxy request queue is full; request was not forwarded",
+                            ),
+                        ),
+                    )
+                }
+            }
             else -> controlMessages.send(message)
         }
     }

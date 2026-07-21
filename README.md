@@ -27,8 +27,8 @@ instead of being retried or silently altered.
 
 - Buffers the initial stdio handshake while Burp is still starting.
 - Recreates and initializes the Streamable HTTP session after Burp restarts.
-- Bounds normal request execution to 16 concurrent HTTP operations with a 64-request queue; stdio naturally
-  backpressures larger bursts while lifecycle and cancellation messages remain responsive.
+- Bounds normal request execution to 16 concurrent HTTP operations with a 64-request queue; excess requests receive
+  an immediate not-forwarded error so lifecycle and cancellation messages remain responsive.
 - Retries any request after send only when the server confirms the old session was not found, or the TCP connection
   was refused before delivery. Ambiguous failures are never retried, including for unknown future methods.
 - Ordinary HTTP requests have no artificial execution timeout, allowing long-running Burp operations.

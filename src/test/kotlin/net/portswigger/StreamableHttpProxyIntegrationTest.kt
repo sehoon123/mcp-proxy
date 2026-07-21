@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Test
@@ -66,14 +67,14 @@ class StreamableHttpProxyIntegrationTest {
     }
 
     @Test
-    fun `bounds concurrent upstream requests and backpressures a burst`() = runBlocking {
+    fun `bounds concurrent upstream requests during a burst`() = runBlocking {
         val probe = ToolConcurrencyProbe(250.milliseconds)
         val server = TestMcpServer(concurrencyProbe = probe)
         val port = server.start()
         val harness = ProxyHarness(
             "http://127.0.0.1:$port/mcp",
             maxConcurrentRequests = 3,
-            requestQueueCapacity = 4,
+            requestQueueCapacity = 12,
         )
         val client = TestStdioMcpClient()
 
@@ -105,35 +106,57 @@ class StreamableHttpProxyIntegrationTest {
                 maxDelay = 100.milliseconds,
             ),
         )
-        val writer = harness.clientOutput.bufferedWriter()
-        val reader = harness.clientInput.bufferedReader()
-
-        suspend fun send(message: String) = withContext(Dispatchers.IO) {
-            writer.write(message)
-            writer.newLine()
-            writer.flush()
-        }
-
-        suspend fun receive() = withContext(Dispatchers.IO) {
-            reader.readLine() ?: error("Proxy closed stdout before responding")
-        }
+        val peer = RawStdioPeer(harness.clientInput, harness.clientOutput)
 
         try {
-            send("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"custom-result-test","version":"1.0"}}}""")
-            val initializeResponse = Json.parseToJsonElement(withTimeout(5.seconds) { receive() }).jsonObject
+            peer.send("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"custom-result-test","version":"1.0"}}}""")
+            val initializeResponse = withTimeout(5.seconds) { peer.receive() }
             assertEquals("1", initializeResponse["id"]?.jsonPrimitive?.content)
 
-            send("""{"jsonrpc":"2.0","method":"notifications/initialized"}""")
-            send("""{"jsonrpc":"2.0","id":2,"method":"custom/echo","params":{"value":"test"}}""")
+            peer.send("""{"jsonrpc":"2.0","method":"notifications/initialized"}""")
+            peer.send("""{"jsonrpc":"2.0","id":2,"method":"custom/echo","params":{"value":"test"}}""")
 
-            val errorResponse = Json.parseToJsonElement(withTimeout(5.seconds) { receive() }).jsonObject
+            val errorResponse = withTimeout(5.seconds) { peer.receive() }
             assertEquals("2", errorResponse["id"]?.jsonPrimitive?.content)
             assertTrue("error" in errorResponse)
             delay(250.milliseconds)
             assertEquals(1, server.customCallCount)
         } finally {
-            runCatching { writer.close() }
-            runCatching { reader.close() }
+            peer.close()
+            harness.close()
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `rejects an excess request before forwarding it`() = runBlocking {
+        val probe = ToolConcurrencyProbe(1.seconds)
+        val server = TestMcpServer(concurrencyProbe = probe)
+        val port = server.start()
+        val harness = ProxyHarness(
+            "http://127.0.0.1:$port/mcp",
+            maxConcurrentRequests = 1,
+            requestQueueCapacity = 1,
+        )
+        val peer = RawStdioPeer(harness.clientInput, harness.clientOutput)
+
+        try {
+            peer.send("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"overload-test","version":"1.0"}}}""")
+            assertEquals("1", withTimeout(5.seconds) { peer.receive() }["id"]?.jsonPrimitive?.content)
+            peer.send("""{"jsonrpc":"2.0","method":"notifications/initialized"}""")
+            for (id in 2..4) {
+                peer.send("""{"jsonrpc":"2.0","id":$id,"method":"tools/call","params":{"name":"concurrency-probe","arguments":{}}}""")
+            }
+
+            val overload = withTimeout(2.seconds) { peer.receive() }
+            assertEquals("4", overload["id"]?.jsonPrimitive?.content)
+            assertTrue(
+                overload["error"]?.jsonObject?.get("message")?.jsonPrimitive?.content
+                    ?.contains("was not forwarded") == true,
+            )
+            assertTrue(probe.maxActive <= 1)
+        } finally {
+            peer.close()
             harness.close()
             server.stop()
         }
@@ -215,6 +238,27 @@ class StreamableHttpProxyIntegrationTest {
 
 private fun io.modelcontextprotocol.kotlin.sdk.types.CallToolResult.firstText(): String =
     (content.first() as TextContent).text
+
+private class RawStdioPeer(input: PipedInputStream, output: PipedOutputStream) {
+    private val reader = input.bufferedReader()
+    private val writer = output.bufferedWriter()
+
+    suspend fun send(message: String) = withContext(Dispatchers.IO) {
+        writer.write(message)
+        writer.newLine()
+        writer.flush()
+    }
+
+    suspend fun receive(): JsonObject = withContext(Dispatchers.IO) {
+        val line = reader.readLine() ?: error("Proxy closed stdout before responding")
+        Json.parseToJsonElement(line).jsonObject
+    }
+
+    fun close() {
+        runCatching { writer.close() }
+        runCatching { reader.close() }
+    }
+}
 
 private class ProxyHarness(
     mcpUrl: String,
