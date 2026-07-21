@@ -22,9 +22,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -48,8 +48,12 @@ import kotlin.time.Duration.Companion.seconds
 
 private const val INITIALIZE_METHOD = "initialize"
 private const val INITIALIZED_METHOD = "notifications/initialized"
-private const val TOOLS_CALL_METHOD = "tools/call"
+private const val MAX_CONCURRENT_UPSTREAM_REQUESTS = 16
+private const val REQUEST_QUEUE_CAPACITY = 64
+private const val CONTROL_QUEUE_CAPACITY = 64
+private const val HANDSHAKE_QUEUE_CAPACITY = 2
 private val EVENT_STREAM_WARMUP_DELAY = 250.milliseconds
+private val RETRYABLE_AVAILABILITY_STATUS_CODES = setOf(404, 408, 425, 429, 500, 502, 503, 504)
 
 internal data class RetryPolicy(
     val maxAttempts: Int = 20,
@@ -71,10 +75,10 @@ internal data class RetryPolicy(
 /**
  * A transparent stdio-to-Streamable-HTTP transport bridge.
  *
- * JSON-RPC messages are relayed without decoding them into a fixed list of MCP methods. This preserves
- * negotiated capabilities, custom methods, cancellation IDs, progress tokens, and future protocol additions.
- * If Burp restarts, the cached initialization handshake is replayed on a new HTTP session before safe requests
- * are retried.
+ * JSON-RPC methods and parameters are relayed without a proxy-side method allowlist. This preserves negotiated
+ * capabilities, request IDs, cancellation IDs, and progress tokens for protocol shapes supported by the pinned
+ * MCP SDK. If Burp restarts, the cached initialization handshake is replayed on a new HTTP session before only
+ * definitively safe requests are retried.
  */
 internal class StreamableHttpProxy(
     private val mcpUrl: String,
@@ -82,6 +86,8 @@ internal class StreamableHttpProxy(
     output: OutputStream = System.out,
     private val retryPolicy: RetryPolicy = RetryPolicy(),
     private val httpClient: HttpClient = defaultHttpClient(),
+    private val maxConcurrentRequests: Int = MAX_CONCURRENT_UPSTREAM_REQUESTS,
+    private val requestQueueCapacity: Int = REQUEST_QUEUE_CAPACITY,
 ) {
     private val logger = LoggerFactory.getLogger(StreamableHttpProxy::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -90,6 +96,14 @@ internal class StreamableHttpProxy(
     private val connectionMutex = Mutex()
     private val handshakeMutex = Mutex()
     private val initialized = CompletableDeferred<Unit>()
+    private val handshakeMessages = Channel<JSONRPCMessage>(HANDSHAKE_QUEUE_CAPACITY)
+    private val requestMessages = Channel<JSONRPCMessage>(requestQueueCapacity)
+    private val controlMessages = Channel<JSONRPCMessage>(CONTROL_QUEUE_CAPACITY)
+
+    init {
+        require(maxConcurrentRequests > 0) { "maxConcurrentRequests must be positive" }
+        require(requestQueueCapacity > 0) { "requestQueueCapacity must be positive" }
+    }
 
     private val stdioTransport = StdioServerTransport(
         input = input.asSource().buffered(),
@@ -106,11 +120,8 @@ internal class StreamableHttpProxy(
     private var initializedNotification: JSONRPCNotification? = null
 
     suspend fun run() {
-        stdioTransport.onMessage { message ->
-            scope.launch(CoroutineName("StreamableHttpProxy.forwardToHttp")) {
-                handleDownstreamMessage(message)
-            }
-        }
+        startRelayWorkers()
+        stdioTransport.onMessage(::enqueueDownstreamMessage)
         stdioTransport.onError { error ->
             logger.error("stdio transport error: {}", error.message, error)
         }
@@ -128,6 +139,29 @@ internal class StreamableHttpProxy(
 
     suspend fun close() {
         shutdown(closeStdio = true)
+    }
+
+    private fun startRelayWorkers() {
+        scope.launch(CoroutineName("StreamableHttpProxy.handshakeRelay")) {
+            for (message in handshakeMessages) handleDownstreamMessage(message)
+        }
+        repeat(maxConcurrentRequests) { worker ->
+            scope.launch(CoroutineName("StreamableHttpProxy.requestRelay-$worker")) {
+                for (message in requestMessages) handleDownstreamMessage(message)
+            }
+        }
+        scope.launch(CoroutineName("StreamableHttpProxy.controlRelay")) {
+            for (message in controlMessages) handleDownstreamMessage(message)
+        }
+    }
+
+    private suspend fun enqueueDownstreamMessage(message: JSONRPCMessage) {
+        when {
+            message is JSONRPCRequest && message.method == INITIALIZE_METHOD -> handshakeMessages.send(message)
+            message is JSONRPCNotification && message.method == INITIALIZED_METHOD -> handshakeMessages.send(message)
+            message is JSONRPCRequest -> requestMessages.send(message)
+            else -> controlMessages.send(message)
+        }
     }
 
     private suspend fun handleDownstreamMessage(message: JSONRPCMessage) {
@@ -177,7 +211,7 @@ internal class StreamableHttpProxy(
                 throw error
             } catch (error: Throwable) {
                 lastError = error
-                if (attempt == retryPolicy.maxAttempts || !isSafeToRetry(message, error)) break
+                if (attempt == retryPolicy.maxAttempts || !isRetryableConnectionFailure(error)) break
                 logRetry(message, attempt, error)
                 delay(retryPolicy.delayBeforeAttempt(attempt))
                 continue
@@ -199,7 +233,7 @@ internal class StreamableHttpProxy(
             } catch (error: Throwable) {
                 lastError = error
                 invalidate(current)
-                if (attempt == retryPolicy.maxAttempts || !isSafeToRetry(message, error)) break
+                if (attempt == retryPolicy.maxAttempts || !isSafeToRetryAfterSend(message, error)) break
                 logRetry(message, attempt, error)
                 delay(retryPolicy.delayBeforeAttempt(attempt))
             }
@@ -337,14 +371,25 @@ internal class StreamableHttpProxy(
         }
     }
 
-    private fun isSafeToRetry(message: JSONRPCMessage, error: Throwable): Boolean {
-        if (message !is JSONRPCRequest || message.method != TOOLS_CALL_METHOD) return true
+    private fun isRetryableConnectionFailure(error: Throwable): Boolean {
+        if (error.findCause<ConnectException>() != null) return true
+        return error.findCause<StreamableHttpError>()?.code in RETRYABLE_AVAILABILITY_STATUS_CODES
+    }
 
-        // A missing session means the server explicitly did not process the call. A refused TCP
-        // connection also occurs before an HTTP request can be delivered. Other failures are
-        // ambiguous, so never risk executing a security tool twice.
-        return error.findCause<StreamableHttpError>()?.code == 404 ||
+    private fun isSafeToRetryAfterSend(message: JSONRPCMessage, error: Throwable): Boolean {
+        // HTTP 404 means the old session was not found, and ConnectException occurs before a
+        // connection can deliver the message. Any other post-send failure is ambiguous and must
+        // not be retried for an arbitrary request: custom and future methods may have side effects.
+        if (error.findCause<StreamableHttpError>()?.code == 404 ||
             error.findCause<ConnectException>() != null
+        ) {
+            return true
+        }
+
+        // Initialization has no tool side effects and is safe to replay while Burp is starting.
+        val isHandshake = (message is JSONRPCRequest && message.method == INITIALIZE_METHOD) ||
+            (message is JSONRPCNotification && message.method == INITIALIZED_METHOD)
+        return isHandshake && isRetryableConnectionFailure(error)
     }
 
     private fun logRetry(message: JSONRPCMessage, attempt: Int, error: Throwable) {
@@ -379,6 +424,11 @@ internal class StreamableHttpProxy(
     private suspend fun shutdown(closeStdio: Boolean) {
         if (!closed.compareAndSet(false, true)) return
 
+        handshakeMessages.close()
+        requestMessages.close()
+        controlMessages.close()
+        scope.cancel()
+
         val current = connectionMutex.withLock {
             connection.also { connection = null }
         }
@@ -409,7 +459,6 @@ internal class StreamableHttpProxy(
 
         httpClient.close()
         finished.complete(Unit)
-        scope.cancel()
     }
 
     private class UpstreamConnection(

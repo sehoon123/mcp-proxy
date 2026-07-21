@@ -15,11 +15,32 @@ import io.modelcontextprotocol.kotlin.sdk.types.Role
 import io.modelcontextprotocol.kotlin.sdk.types.SamplingMessage
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration
+
+internal class ToolConcurrencyProbe(private val executionDelay: Duration) {
+    private val active = AtomicInteger()
+    private val maximum = AtomicInteger()
+
+    val maxActive: Int
+        get() = maximum.get()
+
+    suspend fun execute() {
+        val nowActive = active.incrementAndGet()
+        maximum.accumulateAndGet(nowActive) { current, candidate -> maxOf(current, candidate) }
+        try {
+            delay(executionDelay)
+        } finally {
+            active.decrementAndGet()
+        }
+    }
+}
 
 /** A stateful Streamable HTTP MCP server used by proxy integration tests. */
-class TestMcpServer {
+internal class TestMcpServer(private val concurrencyProbe: ToolConcurrencyProbe? = null) {
     private var port: Int = 0
     private var serverEngine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private var mcpServer: Server? = null
@@ -65,6 +86,16 @@ class TestMcpServer {
             description = "Returns a deterministic test result",
         ) {
             CallToolResult(content = listOf(TextContent("Hello, world!")))
+        }
+
+        concurrencyProbe?.let { probe ->
+            addTool(
+                name = "concurrency-probe",
+                description = "Tracks concurrent proxy requests",
+            ) {
+                probe.execute()
+                CallToolResult(content = listOf(TextContent("completed")))
+            }
         }
 
         addTool(

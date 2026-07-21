@@ -18,16 +18,19 @@ Clients with native Streamable HTTP support should skip the proxy and connect di
 http://127.0.0.1:9876/mcp
 ```
 
-The proxy relays JSON-RPC messages without maintaining a hard-coded list of MCP methods. As a result, negotiated
-capabilities, custom methods, progress, cancellation, sampling, elicitation, and future protocol additions pass
-through without proxy changes.
+The proxy relays JSON-RPC methods and parameters without maintaining a proxy-side method allowlist. Negotiated
+capabilities, request IDs, progress, cancellation, sampling, and elicitation pass through for protocol result shapes
+supported by the pinned MCP SDK. Unknown methods are forwarded, but an unknown response shape is reported as an error
+instead of being retried or silently altered.
 
 ## Reliability
 
 - Buffers the initial stdio handshake while Burp is still starting.
 - Recreates and initializes the Streamable HTTP session after Burp restarts.
-- Retries a `tools/call` only when the server confirms the old session was not found, or the TCP connection was
-  refused before delivery. Ambiguous failures are not retried, preventing accidental duplicate security actions.
+- Bounds normal request execution to 16 concurrent HTTP operations with a 64-request queue; stdio naturally
+  backpressures larger bursts while lifecycle and cancellation messages remain responsive.
+- Retries any request after send only when the server confirms the old session was not found, or the TCP connection
+  was refused before delivery. Ambiguous failures are never retried, including for unknown future methods.
 - Ordinary HTTP requests have no artificial execution timeout, allowing long-running Burp operations.
 
 ## Requirements

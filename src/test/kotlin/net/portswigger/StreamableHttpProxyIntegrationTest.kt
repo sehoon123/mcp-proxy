@@ -6,12 +6,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Test
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
@@ -55,6 +60,80 @@ class StreamableHttpProxyIntegrationTest {
             assertEquals("sampled through stdio", result.firstText())
         } finally {
             runCatching { client.close() }
+            harness.close()
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `bounds concurrent upstream requests and backpressures a burst`() = runBlocking {
+        val probe = ToolConcurrencyProbe(250.milliseconds)
+        val server = TestMcpServer(concurrencyProbe = probe)
+        val port = server.start()
+        val harness = ProxyHarness(
+            "http://127.0.0.1:$port/mcp",
+            maxConcurrentRequests = 3,
+            requestQueueCapacity = 4,
+        )
+        val client = TestStdioMcpClient()
+
+        try {
+            withTimeout(10.seconds) { client.connectToServer(harness.clientInput, harness.clientOutput) }
+            withTimeout(15.seconds) {
+                (1..12).map {
+                    async { client.callTool("concurrency-probe") }
+                }.awaitAll()
+            }
+
+            assertEquals(3, probe.maxActive)
+        } finally {
+            runCatching { client.close() }
+            harness.close()
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `does not retry an ambiguously delivered custom request`() = runBlocking {
+        val server = RawCustomResultServer()
+        val port = server.start()
+        val harness = ProxyHarness(
+            "http://127.0.0.1:$port/mcp",
+            retryPolicy = RetryPolicy(
+                maxAttempts = 3,
+                initialDelay = 50.milliseconds,
+                maxDelay = 100.milliseconds,
+            ),
+        )
+        val writer = harness.clientOutput.bufferedWriter()
+        val reader = harness.clientInput.bufferedReader()
+
+        suspend fun send(message: String) = withContext(Dispatchers.IO) {
+            writer.write(message)
+            writer.newLine()
+            writer.flush()
+        }
+
+        suspend fun receive() = withContext(Dispatchers.IO) {
+            reader.readLine() ?: error("Proxy closed stdout before responding")
+        }
+
+        try {
+            send("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"custom-result-test","version":"1.0"}}}""")
+            val initializeResponse = Json.parseToJsonElement(withTimeout(5.seconds) { receive() }).jsonObject
+            assertEquals("1", initializeResponse["id"]?.jsonPrimitive?.content)
+
+            send("""{"jsonrpc":"2.0","method":"notifications/initialized"}""")
+            send("""{"jsonrpc":"2.0","id":2,"method":"custom/echo","params":{"value":"test"}}""")
+
+            val errorResponse = Json.parseToJsonElement(withTimeout(5.seconds) { receive() }).jsonObject
+            assertEquals("2", errorResponse["id"]?.jsonPrimitive?.content)
+            assertTrue("error" in errorResponse)
+            delay(250.milliseconds)
+            assertEquals(1, server.customCallCount)
+        } finally {
+            runCatching { writer.close() }
+            runCatching { reader.close() }
             harness.close()
             server.stop()
         }
@@ -137,7 +216,16 @@ class StreamableHttpProxyIntegrationTest {
 private fun io.modelcontextprotocol.kotlin.sdk.types.CallToolResult.firstText(): String =
     (content.first() as TextContent).text
 
-private class ProxyHarness(mcpUrl: String) {
+private class ProxyHarness(
+    mcpUrl: String,
+    maxConcurrentRequests: Int = 16,
+    requestQueueCapacity: Int = 64,
+    retryPolicy: RetryPolicy = RetryPolicy(
+        maxAttempts = 20,
+        initialDelay = 100.milliseconds,
+        maxDelay = 1.seconds,
+    ),
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val clientToProxy = PipedOutputStream()
     private val proxyInput = PipedInputStream(clientToProxy, PIPE_BUFFER_SIZE)
@@ -149,11 +237,9 @@ private class ProxyHarness(mcpUrl: String) {
         mcpUrl = mcpUrl,
         input = proxyInput,
         output = proxyToClient,
-        retryPolicy = RetryPolicy(
-            maxAttempts = 20,
-            initialDelay = 100.milliseconds,
-            maxDelay = 1.seconds,
-        ),
+        retryPolicy = retryPolicy,
+        maxConcurrentRequests = maxConcurrentRequests,
+        requestQueueCapacity = requestQueueCapacity,
     )
     private val proxyJob = scope.launch { proxy.run() }
 
