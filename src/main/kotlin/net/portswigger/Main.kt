@@ -13,23 +13,33 @@ private val usage = """
     Burp MCP stdio proxy
 
     Usage:
-      java -jar mcp-proxy-all.jar [--mcp-url <url>]
+      java -jar mcp-proxy-all.jar [--mcp-url <url>] [--bearer-token-env <name>]
 
     Options:
-      --mcp-url <url>  Streamable HTTP MCP endpoint (default: $DEFAULT_MCP_URL)
-      --sse-url <url>  Deprecated alias. A root URL is automatically migrated to /mcp.
-      -h, --help       Show this help.
+      --mcp-url <url>          Streamable HTTP MCP endpoint (default: $DEFAULT_MCP_URL)
+      --bearer-token <token>   Bearer token (prefer --bearer-token-env to avoid process listings)
+      --bearer-token-env <n>   Read the bearer token from environment variable <n>
+      --sse-url <url>          Deprecated alias. A root URL is automatically migrated to /mcp.
+      -h, --help               Show this help.
 """.trimIndent()
 
 data class ProxyConfig(
     val mcpUrl: String = DEFAULT_MCP_URL,
     val usedLegacySseArgument: Boolean = false,
-)
+    val bearerToken: String? = null,
+) {
+    override fun toString(): String =
+        "ProxyConfig(mcpUrl=$mcpUrl, usedLegacySseArgument=$usedLegacySseArgument, bearerToken=${if (bearerToken == null) "<none>" else "<redacted>"})"
+}
 
 /** Parse and validate command-line arguments without writing to stdout. */
-fun parseCommandLineArgs(args: Array<String>): ProxyConfig {
+fun parseCommandLineArgs(
+    args: Array<String>,
+    environment: Map<String, String> = System.getenv(),
+): ProxyConfig {
     var mcpUrl = DEFAULT_MCP_URL
     var usedLegacySseArgument = false
+    var bearerToken: String? = null
     var index = 0
 
     while (index < args.size) {
@@ -42,12 +52,45 @@ fun parseCommandLineArgs(args: Array<String>): ProxyConfig {
                 index += 2
             }
 
+            "--bearer-token" -> {
+                require(index + 1 < args.size) { "Missing token after $option" }
+                require(bearerToken == null) { "Specify only one bearer-token option" }
+                bearerToken = validateBearerToken(args[index + 1])
+                index += 2
+            }
+
+            "--bearer-token-env" -> {
+                require(index + 1 < args.size) { "Missing environment variable name after $option" }
+                require(bearerToken == null) { "Specify only one bearer-token option" }
+                val variable = args[index + 1]
+                require(variable.matches(Regex("[A-Za-z_][A-Za-z0-9_]{0,127}"))) {
+                    "Invalid bearer-token environment variable name"
+                }
+                bearerToken = validateBearerToken(
+                    environment[variable] ?: throw IllegalArgumentException(
+                        "Bearer-token environment variable $variable is not set"
+                    )
+                )
+                index += 2
+            }
+
             "-h", "--help" -> error("Help is handled before argument parsing")
             else -> throw IllegalArgumentException("Unknown argument: $option")
         }
     }
 
-    return ProxyConfig(mcpUrl = mcpUrl, usedLegacySseArgument = usedLegacySseArgument)
+    return ProxyConfig(
+        mcpUrl = mcpUrl,
+        usedLegacySseArgument = usedLegacySseArgument,
+        bearerToken = bearerToken,
+    )
+}
+
+private fun validateBearerToken(value: String): String {
+    require(value.length in 1..8_192 && value.none { it.isWhitespace() || it.isISOControl() }) {
+        "Bearer token must contain 1 to 8192 non-whitespace characters"
+    }
+    return value
 }
 
 /**
@@ -99,7 +142,10 @@ fun main(args: Array<String>) {
         }
 
         logger.info("Starting Burp MCP stdio proxy with Streamable HTTP endpoint: {}", config.mcpUrl)
-        val proxy = StreamableHttpProxy(mcpUrl = config.mcpUrl)
+        val proxy = StreamableHttpProxy(
+            mcpUrl = config.mcpUrl,
+            bearerToken = config.bearerToken,
+        )
         val shutdownHook = Thread(
             { runBlocking { proxy.close() } },
             "mcp-proxy-shutdown",

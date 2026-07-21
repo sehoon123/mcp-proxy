@@ -49,11 +49,15 @@ The executable JAR is written under `build/libs/`.
 ## Usage
 
 ```bash
+export BURP_MCP_BEARER_TOKEN='<copy the token from Burp MCP settings>'
 java -jar mcp-proxy-all.jar \
-  --mcp-url http://127.0.0.1:9876/mcp
+  --mcp-url http://127.0.0.1:9876/mcp \
+  --bearer-token-env BURP_MCP_BEARER_TOKEN
 ```
 
-The default endpoint is `http://localhost:9876/mcp`, so the argument can usually be omitted.
+The default endpoint is `http://localhost:9876/mcp`, so the URL argument can usually be omitted. The Burp extension's
+installer configures the environment variable automatically. `--bearer-token <token>` is available for launchers that
+cannot set environment variables, but the environment option avoids exposing the credential in process listings.
 
 ### Migration from the legacy proxy
 

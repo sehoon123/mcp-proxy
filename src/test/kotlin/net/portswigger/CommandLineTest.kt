@@ -51,8 +51,37 @@ class CommandLineTest {
     }
 
     @Test
-    fun `rejects missing values and unknown arguments`() {
+    fun `reads bearer token from an environment variable without exposing it in toString`() {
+        val config = parseCommandLineArgs(
+            arrayOf("--bearer-token-env", "BURP_MCP_TOKEN"),
+            mapOf("BURP_MCP_TOKEN" to "secret-token"),
+        )
+
+        assertEquals("secret-token", config.bearerToken)
+        assertFalse(config.toString().contains("secret-token"))
+        assertTrue(config.toString().contains("<redacted>"))
+    }
+
+    @Test
+    fun `accepts a direct bearer token for custom launchers`() {
+        assertEquals(
+            "secret-token",
+            parseCommandLineArgs(arrayOf("--bearer-token", "secret-token")).bearerToken,
+        )
+    }
+
+    @Test
+    fun `rejects missing values unknown arguments and invalid bearer options`() {
         assertThrows<IllegalArgumentException> { parseCommandLineArgs(arrayOf("--mcp-url")) }
         assertThrows<IllegalArgumentException> { parseCommandLineArgs(arrayOf("--unknown")) }
+        assertThrows<IllegalArgumentException> {
+            parseCommandLineArgs(arrayOf("--bearer-token-env", "MISSING"), emptyMap())
+        }
+        assertThrows<IllegalArgumentException> {
+            parseCommandLineArgs(arrayOf("--bearer-token", "one", "--bearer-token", "two"))
+        }
+        assertThrows<IllegalArgumentException> {
+            parseCommandLineArgs(arrayOf("--bearer-token", "contains whitespace"))
+        }
     }
 }

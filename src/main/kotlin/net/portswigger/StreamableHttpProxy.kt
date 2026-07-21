@@ -5,6 +5,7 @@ import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.HttpTimeoutConfig
 import io.ktor.client.plugins.sse.SSE
+import io.ktor.http.HttpHeaders
 import io.modelcontextprotocol.kotlin.sdk.client.ReconnectionOptions
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpError
@@ -83,6 +84,7 @@ internal data class RetryPolicy(
  */
 internal class StreamableHttpProxy(
     private val mcpUrl: String,
+    private val bearerToken: String? = null,
     input: InputStream = System.`in`,
     output: OutputStream = System.out,
     private val retryPolicy: RetryPolicy = RetryPolicy(),
@@ -282,6 +284,9 @@ internal class StreamableHttpProxy(
             client = httpClient,
             url = mcpUrl,
             reconnectionOptions = ReconnectionOptions(maxRetries = 5),
+            requestBuilder = {
+                bearerToken?.let { headers.append(HttpHeaders.Authorization, "Bearer $it") }
+            },
         )
         val created = UpstreamConnection(transport)
 
