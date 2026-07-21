@@ -1,98 +1,89 @@
 package net.portswigger
 
-import io.ktor.server.cio.*
-import io.ktor.server.engine.*
-import io.modelcontextprotocol.kotlin.sdk.*
+import io.ktor.server.cio.CIO
+import io.ktor.server.cio.CIOApplicationEngine
+import io.ktor.server.engine.EmbeddedServer
+import io.ktor.server.engine.embeddedServer
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
-import io.modelcontextprotocol.kotlin.sdk.server.mcp
+import io.modelcontextprotocol.kotlin.sdk.server.mcpStreamableHttp
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.modelcontextprotocol.kotlin.sdk.types.CreateMessageRequest
+import io.modelcontextprotocol.kotlin.sdk.types.CreateMessageRequestParams
+import io.modelcontextprotocol.kotlin.sdk.types.Implementation
+import io.modelcontextprotocol.kotlin.sdk.types.Role
+import io.modelcontextprotocol.kotlin.sdk.types.SamplingMessage
+import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
+import io.modelcontextprotocol.kotlin.sdk.types.TextContent
+import kotlinx.coroutines.runBlocking
 import java.net.ServerSocket
 
-/**
- * Test server utility class for MCP testing.
- * Provides a reusable MCP server for other tests.
- */
+/** A stateful Streamable HTTP MCP server used by proxy integration tests. */
 class TestMcpServer {
     private var port: Int = 0
     private var serverEngine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
-    private val server: Server = configureServer()
+    private var mcpServer: Server? = null
 
     fun start(port: Int = 0): Int {
+        check(serverEngine == null) { "Test server is already running" }
         this.port = if (port == 0) findAvailablePort() else port
-        
-        serverEngine = embeddedServer(CIO, host = "0.0.0.0", port = this.port) {
-            mcp {
-                server
+        val configuredServer = configureServer()
+        mcpServer = configuredServer
+
+        serverEngine = embeddedServer(CIO, host = "127.0.0.1", port = this.port) {
+            mcpStreamableHttp(path = "/mcp") {
+                configuredServer
             }
         }.start(wait = false)
-        
-        Thread.sleep(500)
-        
+
+        Thread.sleep(300)
         return this.port
     }
-    
+
     fun stop() {
-        serverEngine?.stop(1000, 1000)
+        serverEngine?.stop(500, 1_000)
         serverEngine = null
+        runBlocking { mcpServer?.close() }
+        mcpServer = null
         port = 0
     }
-    
-    fun getPort(): Int = port
 
-    fun isRunning(): Boolean = serverEngine != null && port != 0
-    
-    private fun findAvailablePort(): Int {
-        return ServerSocket(0).use { it.localPort }
-    }
-    
-    private fun configureServer(): Server {
-        val server = Server(
-            Implementation(
-                name = "mcp-kotlin test server",
-                version = "0.1.0"
+    private fun findAvailablePort(): Int = ServerSocket(0).use { it.localPort }
+
+    private fun configureServer(): Server = Server(
+        serverInfo = Implementation(name = "mcp-proxy-test-server", version = "1.0.0"),
+        options = ServerOptions(
+            capabilities = ServerCapabilities(
+                tools = ServerCapabilities.Tools(listChanged = false),
             ),
-            ServerOptions(
-                capabilities = ServerCapabilities(
-                    tools = ServerCapabilities.Tools(listChanged = false),
-                )
-            )
-        )
-
-        server.addTool(
+        ),
+    ).apply {
+        addTool(
             name = "kotlin-sdk-tool",
-            description = "A test tool",
-            inputSchema = Tool.Input()
+            description = "Returns a deterministic test result",
         ) {
-            CallToolResult(
-                content = listOf(TextContent("Hello, world!"))
-            )
+            CallToolResult(content = listOf(TextContent("Hello, world!")))
         }
 
-        return server
+        addTool(
+            name = "sampling-round-trip",
+            description = "Asks the stdio client to sample a response",
+        ) {
+            val sampled = createMessage(
+                CreateMessageRequest(
+                    CreateMessageRequestParams(
+                        messages = listOf(SamplingMessage(Role.User, TextContent("sample this"))),
+                        maxTokens = 32,
+                    ),
+                ),
+            )
+            val text = (sampled.content.firstOrNull() as? TextContent)?.text
+                ?: "unexpected sampling response"
+            CallToolResult(content = listOf(TextContent(text)))
+        }
     }
-    
+
     companion object {
-        private var instance: TestMcpServer? = null
-        
-        @JvmStatic
-        fun getInstance(): TestMcpServer {
-            return instance ?: TestMcpServer().also { instance = it }
-        }
-        
-        @JvmStatic
-        fun startServer(port: Int = 0): Int {
-            val server = getInstance()
-            return if (!server.isRunning()) {
-                server.start(port)
-            } else {
-                server.getPort()
-            }
-        }
-        
-        @JvmStatic
-        fun stopServer() {
-            instance?.stop()
-            instance = null
-        }
+        fun findAvailablePort(): Int = ServerSocket(0).use { it.localPort }
     }
 }

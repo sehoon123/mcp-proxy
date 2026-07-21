@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      kotlin-and-ktor:
+        patterns:
+          - "org.jetbrains.kotlin*"
+          - "io.ktor*"
+          - "io.modelcontextprotocol*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

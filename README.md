@@ -1,32 +1,74 @@
 # MCP Proxy
 
-A Stdio MCP server which proxies an SSE MCP server.
+A transparent **stdio ↔ Streamable HTTP** transport bridge for MCP.
 
-## Overview
+This project is the compatibility component embedded in the Burp MCP extension. End users normally install only
+`burp-mcp-all.jar`; the extension extracts this proxy when a client supports stdio but cannot connect to Streamable
+HTTP directly.
 
-This proxy acts as a bridge between:
-- An SSE-based MCP server endpoint
-- Standard input/output for MCP client communication
+## Architecture
 
-It enables tools that use standard I/O for communication such as Claude Desktop (as of 2025-04-01) to interact with MCP implementations through an SSE interface.
+```text
+stdio-only MCP client  <──stdio──>  mcp-proxy  <──Streamable HTTP──>  Burp /mcp
+```
+
+Clients with native Streamable HTTP support should skip the proxy and connect directly to:
+
+```text
+http://127.0.0.1:9876/mcp
+```
+
+The proxy relays JSON-RPC messages without maintaining a hard-coded list of MCP methods. As a result, negotiated
+capabilities, custom methods, progress, cancellation, sampling, elicitation, and future protocol additions pass
+through without proxy changes.
+
+## Reliability
+
+- Buffers the initial stdio handshake while Burp is still starting.
+- Recreates and initializes the Streamable HTTP session after Burp restarts.
+- Retries a `tools/call` only when the server confirms the old session was not found, or the TCP connection was
+  refused before delivery. Ambiguous failures are not retried, preventing accidental duplicate security actions.
+- Ordinary HTTP requests have no artificial execution timeout, allowing long-running Burp operations.
 
 ## Requirements
 
-- JDK 21 or higher
-- Gradle 8.0+ (Wrapper included)
+- JDK 21 or newer
+- Gradle wrapper included
 
+## Build
 
-## Build Jar
 ```bash
 ./gradlew shadowJar
 ```
 
+The executable JAR is written under `build/libs/`.
+
+## Usage
+
+```bash
+java -jar mcp-proxy-all.jar \
+  --mcp-url http://127.0.0.1:9876/mcp
+```
+
+The default endpoint is `http://localhost:9876/mcp`, so the argument can usually be omitted.
+
+### Migration from the legacy proxy
+
+Existing configurations using the old option continue to work:
+
+```bash
+java -jar mcp-proxy-all.jar \
+  --sse-url http://127.0.0.1:9876
+```
+
+`--sse-url` is a deprecated compatibility alias. A root URL is converted to `/mcp`, and all communication uses
+Streamable HTTP; the proxy no longer connects to the deprecated two-endpoint HTTP+SSE transport.
+
 ## Testing
 
 ```bash
-# Run all tests
 ./gradlew test
-
-# Run a specific test
-./gradlew test --tests "net.portswigger.TestName"
 ```
+
+Integration tests cover direct tool calls, delayed Burp startup, session recovery after a restart, and a
+server-initiated sampling request relayed back through stdio.

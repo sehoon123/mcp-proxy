@@ -1,261 +1,105 @@
 package net.portswigger
 
-import io.modelcontextprotocol.kotlin.sdk.*
-import io.modelcontextprotocol.kotlin.sdk.client.Client
-import io.modelcontextprotocol.kotlin.sdk.server.Server
-import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
-import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
-import kotlinx.io.asSink
-import kotlinx.io.asSource
-import kotlinx.io.buffered
 import org.slf4j.LoggerFactory
+import java.net.URI
 import kotlin.system.exitProcess
 
-private val loggerMain = LoggerFactory.getLogger("net.portswigger.Main")
+private val logger = LoggerFactory.getLogger("net.portswigger.Main")
 
-data class SseToStdioArgs(
-    val sseUrl: String
+const val DEFAULT_MCP_URL = "http://localhost:9876/mcp"
+
+private val usage = """
+    Burp MCP stdio proxy
+
+    Usage:
+      java -jar mcp-proxy-all.jar [--mcp-url <url>]
+
+    Options:
+      --mcp-url <url>  Streamable HTTP MCP endpoint (default: $DEFAULT_MCP_URL)
+      --sse-url <url>  Deprecated alias. A root URL is automatically migrated to /mcp.
+      -h, --help       Show this help.
+""".trimIndent()
+
+data class ProxyConfig(
+    val mcpUrl: String = DEFAULT_MCP_URL,
+    val usedLegacySseArgument: Boolean = false,
 )
 
-enum class ConnectionState {
-    CONNECTED, CONNECTING, DISCONNECTED
-}
+/** Parse and validate command-line arguments without writing to stdout. */
+fun parseCommandLineArgs(args: Array<String>): ProxyConfig {
+    var mcpUrl = DEFAULT_MCP_URL
+    var usedLegacySseArgument = false
+    var index = 0
 
-fun sseToStdio(args: SseToStdioArgs) = runBlocking {
-    val sseUrl = args.sseUrl
-    val sseClientManager = SseClient(
-        sseUrl = sseUrl, clientInfo = Implementation(
-            name = "burp-proxy", version = "1.0.0"
-        )
-    )
-
-    val connected = sseClientManager.connect()
-    if (!connected) {
-        loggerMain.warn("Please check if the server is running and the URL is correct")
-        loggerMain.info("Will attempt to reconnect automatically when needed")
-    }
-
-    val sseClient = sseClientManager.getClient()
-    val stdioServer = Server(
-        serverInfo = sseClient.serverVersion ?: Implementation("burp-suite", "1.0"), options = ServerOptions(
-            capabilities = sseClient.serverCapabilities ?: ServerCapabilities()
-        )
-    )
-
-    setupRequestHandlers(sseClient, stdioServer, sseClientManager)
-    setupNotificationHandlers(sseClient, stdioServer, sseClientManager)
-
-    val transport = StdioServerTransport(
-        inputStream = System.`in`.asSource().buffered(), outputStream = System.out.asSink().buffered()
-    )
-
-    runBlocking {
-        try {
-            stdioServer.connect(transport)
-            val done = Job()
-            stdioServer.onClose {
-                done.complete()
+    while (index < args.size) {
+        val option = args[index]
+        when (option) {
+            "--mcp-url", "--sse-url" -> {
+                require(index + 1 < args.size) { "Missing URL after $option" }
+                mcpUrl = normalizeMcpUrl(args[index + 1])
+                usedLegacySseArgument = option == "--sse-url"
+                index += 2
             }
-            done.join()
-        } catch (e: Exception) {
-            loggerMain.error("Error in stdio server: {}", e.message, e)
-        } finally {
-            sseClientManager.close()
-        }
-    }
-}
 
-private class NotificationRegistrar(
-    private val client: Client, private val server: Server, private val connectionManager: SseClient
-) {
-    private val logger = LoggerFactory.getLogger(NotificationRegistrar::class.java)
-
-    inline fun <reified T : Notification> register(method: Method) {
-        client.setNotificationHandler<T>(method) { notification ->
-            try {
-                runBlocking {
-                    connectionManager.withConnection { _ ->
-                        server.notification(notification)
-                    }
-                }
-                CompletableDeferred(Unit)
-            } catch (e: Exception) {
-                val message = "Connection error for ${method.value} notification: ${e.message}"
-                logger.error(message)
-
-                CompletableDeferred(Unit)
-            }
-        }
-    }
-}
-
-private class RequestHandlerRegistrar(
-    private val server: Server,
-    private val connectionManager: SseClient? = null
-) {
-    private val logger = LoggerFactory.getLogger(RequestHandlerRegistrar::class.java)
-
-    inline fun <reified T : Request> register(
-        method: Method, crossinline handler: suspend (T) -> RequestResult?
-    ) {
-        server.setRequestHandler<T>(method) { params, _ ->
-            try {
-                handler(params)
-            } catch (e: Exception) {
-                if (e.message?.contains("Session not found") == true && connectionManager != null) {
-                    logger.warn("Detected session not found error during ${method.value}, triggering reconnection")
-                    connectionManager.connectionStateMutableStateFlow.value = ConnectionState.DISCONNECTED
-
-                    if (connectionManager.connect()) {
-                        try {
-                            logger.info("Reconnection successful, retrying method ${method.value}")
-                            val result = handler(params)
-                            logger.info("Method retry successful")
-                            result
-                        } catch (retryException: Exception) {
-                            logger.error("Method retry failed after reconnection: {}", retryException.message)
-                            throw retryException
-                        }
-                    } else {
-                        throw e
-                    }
-                } else {
-                    throw e
-                }
-            }
-        }
-    }
-}
-
-private fun Client.withServer(
-    server: Server, connectionManager: SseClient, block: NotificationRegistrar.() -> Unit
-) {
-    NotificationRegistrar(this, server, connectionManager).apply(block)
-}
-
-private fun Server.withClient(
-    connectionManager: SseClient? = null,
-    block: RequestHandlerRegistrar.() -> Unit
-) {
-    RequestHandlerRegistrar(this, connectionManager).apply(block)
-}
-
-private fun setupRequestHandlers(client: Client, server: Server, connectionManager: SseClient? = null) {
-    server.withClient(connectionManager) {
-        register<InitializeRequest>(Method.Defined.Initialize) { params ->
-            client.request<InitializeResult>(params)
-        }
-        register<ListToolsRequest>(Method.Defined.ToolsList) { _ ->
-            client.listTools()
-        }
-        register<CallToolRequest>(Method.Defined.ToolsCall) { params ->
-            client.callTool(params)
-        }
-        register<CreateMessageRequest>(Method.Defined.SamplingCreateMessage) { params ->
-            client.request<CreateMessageResult>(params)
-        }
-        register<ListRootsRequest>(Method.Defined.RootsList) { params ->
-            client.request<ListRootsResult>(params)
-        }
-        register<PingRequest>(Method.Defined.Ping) { _ ->
-            client.ping()
-        }
-        register<LoggingMessageNotification.SetLevelRequest>(Method.Defined.LoggingSetLevel) { params ->
-            client.setLoggingLevel(params.level)
+            "-h", "--help" -> error("Help is handled before argument parsing")
+            else -> throw IllegalArgumentException("Unknown argument: $option")
         }
     }
 
-    if (client.serverCapabilities?.resources?.listChanged == true) {
-        server.withClient(connectionManager) {
-            register<ListResourcesRequest>(Method.Defined.ResourcesList) { params ->
-                client.listResources(params)
-            }
-        }
-    }
-
-    if (client.serverCapabilities?.resources != null) {
-        server.withClient(connectionManager) {
-            register<ReadResourceRequest>(Method.Defined.ResourcesRead) { params ->
-                client.readResource(params)
-            }
-            register<SubscribeRequest>(Method.Defined.ResourcesSubscribe) { params ->
-                client.subscribeResource(params)
-            }
-            register<UnsubscribeRequest>(Method.Defined.ResourcesUnsubscribe) { params ->
-                client.unsubscribeResource(params)
-            }
-            register<ListResourceTemplatesRequest>(Method.Defined.ResourcesTemplatesList) { params ->
-                client.listResourceTemplates(params)
-            }
-        }
-    }
-
-    if (client.serverCapabilities?.prompts?.listChanged == true) {
-        server.withClient(connectionManager) {
-            register<ListPromptsRequest>(Method.Defined.PromptsList) { params ->
-                client.listPrompts(params)
-            }
-        }
-    }
-
-    if (client.serverCapabilities?.prompts != null) {
-        server.withClient(connectionManager) {
-            register<GetPromptRequest>(Method.Defined.PromptsGet) { params ->
-                client.getPrompt(params)
-            }
-        }
-    }
-}
-
-private fun setupNotificationHandlers(client: Client, server: Server, connectionManager: SseClient) {
-    client.withServer(server, connectionManager) {
-        register<ToolListChangedNotification>(Method.Defined.NotificationsToolsListChanged)
-        register<ResourceListChangedNotification>(Method.Defined.NotificationsResourcesListChanged)
-        register<ResourceUpdatedNotification>(Method.Defined.NotificationsResourcesUpdated)
-        register<PromptListChangedNotification>(Method.Defined.NotificationsPromptsListChanged)
-        register<RootsListChangedNotification>(Method.Defined.NotificationsRootsListChanged)
-        register<LoggingMessageNotification>(Method.Defined.NotificationsMessage)
-        register<CancelledNotification>(Method.Defined.NotificationsCancelled)
-        register<ProgressNotification>(Method.Defined.NotificationsProgress)
-        register<InitializedNotification>(Method.Defined.NotificationsInitialized)
-    }
+    return ProxyConfig(mcpUrl = mcpUrl, usedLegacySseArgument = usedLegacySseArgument)
 }
 
 /**
- * Parse command line arguments.
- *
- * @param args Command line arguments
- * @return The SSE URL extracted from arguments or the default one
+ * Validates an HTTP(S) endpoint and appends the standard `/mcp` path to a root URL.
+ * Existing non-root paths are preserved for custom deployments.
  */
-fun parseCommandLineArgs(args: Array<String>): String {
-    return if (args.size >= 2 && args[0] == "--sse-url") {
-        args[1]
-    } else {
-        "http://localhost:9876"
+fun normalizeMcpUrl(value: String): String {
+    val uri = runCatching { URI(value.trim()) }
+        .getOrElse { throw IllegalArgumentException("Invalid MCP URL: $value", it) }
+
+    require(uri.scheme == "http" || uri.scheme == "https") {
+        "MCP URL must use http or https"
     }
+    require(!uri.host.isNullOrBlank()) { "MCP URL must include a host" }
+    require(uri.userInfo == null) { "Credentials must not be embedded in the MCP URL" }
+    require(uri.query == null) { "MCP URL must not include query parameters" }
+    require(uri.fragment == null) { "MCP URL must not include a fragment" }
+
+    val path = when (uri.path) {
+        null, "", "/" -> "/mcp"
+        else -> uri.path
+    }
+
+    return URI(
+        uri.scheme,
+        null,
+        uri.host,
+        uri.port,
+        path,
+        uri.query,
+        null,
+    ).toASCIIString()
 }
 
-/**
- * Start the MCP proxy.
- *
- * @param args Command line arguments:
- * - "--sse-url <url>": The URL of the SSE MCP server (default: http://localhost:9876)
- */
 fun main(args: Array<String>) {
-    try {
-        val sseUrl = parseCommandLineArgs(args)
-        loggerMain.info("Starting Burp MCP proxy with SSE URL: {}", sseUrl)
+    if (args.any { it == "-h" || it == "--help" }) {
+        println(usage)
+        return
+    }
 
-        sseToStdio(
-            SseToStdioArgs(
-                sseUrl = sseUrl
-            )
-        )
-    } catch (e: Exception) {
-        loggerMain.error("Failed to start proxy: {}", e.message, e)
+    try {
+        val config = parseCommandLineArgs(args)
+        if (config.usedLegacySseArgument) {
+            logger.warn("--sse-url is deprecated; using Streamable HTTP endpoint {}", config.mcpUrl)
+        }
+
+        logger.info("Starting Burp MCP stdio proxy with Streamable HTTP endpoint: {}", config.mcpUrl)
+        runBlocking {
+            StreamableHttpProxy(mcpUrl = config.mcpUrl).run()
+        }
+    } catch (error: Exception) {
+        logger.error("Failed to start proxy: {}", error.message, error)
         exitProcess(1)
     }
 }
