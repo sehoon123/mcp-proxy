@@ -39,7 +39,7 @@ import java.io.OutputStream
 import java.net.ConnectException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
+import java.util.UUID
 import kotlin.math.min
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -88,7 +88,6 @@ internal class StreamableHttpProxy(
     private val closed = AtomicBoolean(false)
     private val connectionMutex = Mutex()
     private val handshakeMutex = Mutex()
-    private val reconnectCounter = AtomicLong(0)
     private val initialized = CompletableDeferred<Unit>()
 
     private val stdioTransport = StdioServerTransport(
@@ -262,7 +261,7 @@ internal class StreamableHttpProxy(
         }
 
         val replayRequest = cachedInitialize.copy(
-            id = RequestId("mcp-proxy-reconnect-${reconnectCounter.incrementAndGet()}"),
+            id = RequestId("mcp-proxy-reconnect-${UUID.randomUUID()}"),
         )
         val response = sendInternalRequest(current, replayRequest)
         when (response) {
