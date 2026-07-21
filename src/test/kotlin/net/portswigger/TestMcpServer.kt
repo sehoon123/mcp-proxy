@@ -40,6 +40,8 @@ class TestMcpServer {
         return this.port
     }
 
+    fun activeSessionCount(): Int = mcpServer?.sessions?.size ?: 0
+
     fun stop() {
         serverEngine?.stop(500, 1_000)
         serverEngine = null

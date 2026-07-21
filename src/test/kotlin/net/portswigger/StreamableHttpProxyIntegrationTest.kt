@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.Test
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
@@ -106,6 +107,31 @@ class StreamableHttpProxyIntegrationTest {
             server.stop()
         }
     }
+
+    @Test
+    fun `graceful proxy shutdown terminates the HTTP session`() = runBlocking {
+        val server = TestMcpServer()
+        val port = server.start()
+        val harness = ProxyHarness("http://127.0.0.1:$port/mcp")
+        val client = TestStdioMcpClient()
+
+        try {
+            withTimeout(10.seconds) { client.connectToServer(harness.clientInput, harness.clientOutput) }
+            assertEquals(1, server.activeSessionCount())
+
+            client.close()
+            harness.close()
+            withTimeout(5.seconds) {
+                while (server.activeSessionCount() != 0) delay(25.milliseconds)
+            }
+
+            assertEquals(0, server.activeSessionCount())
+        } finally {
+            runCatching { client.close() }
+            harness.close()
+            server.stop()
+        }
+    }
 }
 
 private fun io.modelcontextprotocol.kotlin.sdk.types.CallToolResult.firstText(): String =
@@ -135,7 +161,8 @@ private class ProxyHarness(mcpUrl: String) {
         runCatching { proxy.close() }
         runCatching { clientOutput.close() }
         runCatching { clientInput.close() }
-        proxyJob.cancelAndJoin()
+        withTimeoutOrNull(5.seconds) { proxyJob.join() }
+        if (proxyJob.isActive) proxyJob.cancelAndJoin()
         scope.cancel()
     }
 

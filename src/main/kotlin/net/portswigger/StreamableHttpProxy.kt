@@ -30,6 +30,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.io.asSink
 import kotlinx.io.asSource
 import kotlinx.io.buffered
@@ -378,15 +379,34 @@ internal class StreamableHttpProxy(
     private suspend fun shutdown(closeStdio: Boolean) {
         if (!closed.compareAndSet(false, true)) return
 
-        if (closeStdio) {
-            runCatching { stdioTransport.close() }
-        }
-
         val current = connectionMutex.withLock {
             connection.also { connection = null }
         }
         current?.retired?.set(true)
-        current?.let { runCatching { it.transport.close() } }
+        current?.let {
+            if (it.transport.sessionId != null) {
+                val terminated = withTimeoutOrNull(2.seconds) {
+                    try {
+                        it.transport.terminateSession()
+                        true
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        logger.debug("Unable to terminate MCP session: {}", error.message)
+                        false
+                    }
+                }
+                if (terminated != true) {
+                    logger.debug("MCP session termination did not complete")
+                }
+            }
+            runCatching { it.transport.close() }
+        }
+
+        if (closeStdio) {
+            runCatching { stdioTransport.close() }
+        }
+
         httpClient.close()
         finished.complete(Unit)
         scope.cancel()

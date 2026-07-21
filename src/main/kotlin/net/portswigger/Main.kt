@@ -95,8 +95,16 @@ fun main(args: Array<String>) {
         }
 
         logger.info("Starting Burp MCP stdio proxy with Streamable HTTP endpoint: {}", config.mcpUrl)
-        runBlocking {
-            StreamableHttpProxy(mcpUrl = config.mcpUrl).run()
+        val proxy = StreamableHttpProxy(mcpUrl = config.mcpUrl)
+        val shutdownHook = Thread(
+            { runBlocking { proxy.close() } },
+            "mcp-proxy-shutdown",
+        )
+        Runtime.getRuntime().addShutdownHook(shutdownHook)
+        try {
+            runBlocking { proxy.run() }
+        } finally {
+            runCatching { Runtime.getRuntime().removeShutdownHook(shutdownHook) }
         }
     } catch (error: Exception) {
         logger.error("Failed to start proxy: {}", error.message, error)
