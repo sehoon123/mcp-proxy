@@ -37,6 +37,13 @@ jobs:
       - name: Build proxy JAR
         run: ./gradlew shadowJar
 
+      - name: Verify reproducible proxy JAR
+        shell: bash
+        run: |
+          cp build/libs/mcp-proxy-all.jar "$RUNNER_TEMP/mcp-proxy-first.jar"
+          ./gradlew shadowJar --rerun-tasks
+          cmp "$RUNNER_TEMP/mcp-proxy-first.jar" build/libs/mcp-proxy-all.jar
+
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
