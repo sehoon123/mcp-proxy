@@ -34,6 +34,11 @@ kotlin {
     jvmToolchain(21)
 }
 
+tasks.withType<AbstractArchiveTask>().configureEach {
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+}
+
 tasks.jar {
     manifest {
         attributes(
