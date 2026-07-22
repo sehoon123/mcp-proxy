@@ -55,9 +55,10 @@ java -jar mcp-proxy-all.jar \
   --bearer-token-env BURP_MCP_BEARER_TOKEN
 ```
 
-The default endpoint is `http://localhost:9876/mcp`, so the URL argument can usually be omitted. The Burp extension's
-installer configures the environment variable automatically. `--bearer-token <token>` is available for launchers that
-cannot set environment variables, but the environment option avoids exposing the credential in process listings.
+The default endpoint is `http://127.0.0.1:9876/mcp`, so the URL argument can usually be omitted. To prevent bearer-token
+exfiltration, the proxy accepts only numeric loopback hosts (`127.0.0.1` or `::1`) and the exact `/mcp` path. The Burp
+extension's installer configures the environment variable automatically. `--bearer-token <token>` is available for
+launchers that cannot set environment variables, but the environment option avoids exposing the credential in process listings.
 
 ### Migration from the legacy proxy
 

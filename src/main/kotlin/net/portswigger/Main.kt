@@ -7,7 +7,7 @@ import kotlin.system.exitProcess
 
 private val logger = LoggerFactory.getLogger("net.portswigger.Main")
 
-const val DEFAULT_MCP_URL = "http://localhost:9876/mcp"
+const val DEFAULT_MCP_URL = "http://127.0.0.1:9876/mcp"
 
 private val usage = """
     Burp MCP stdio proxy
@@ -75,7 +75,7 @@ fun parseCommandLineArgs(
             }
 
             "-h", "--help" -> error("Help is handled before argument parsing")
-            else -> throw IllegalArgumentException("Unknown argument: $option")
+            else -> throw IllegalArgumentException("Unknown command-line option")
         }
     }
 
@@ -87,42 +87,64 @@ fun parseCommandLineArgs(
 }
 
 private fun validateBearerToken(value: String): String {
-    require(value.length in 1..8_192 && value.none { it.isWhitespace() || it.isISOControl() }) {
-        "Bearer token must contain 1 to 8192 non-whitespace characters"
+    require(value.length in 32..128 && value.none { it.isWhitespace() || it.isISOControl() }) {
+        "Bearer token must contain 32 to 128 non-whitespace characters"
     }
     return value
 }
 
 /**
- * Validates an HTTP(S) endpoint and appends the standard `/mcp` path to a root URL.
- * Existing non-root paths are preserved for custom deployments.
+ * Validates a numeric-loopback HTTP(S) endpoint and appends the standard `/mcp` path to a root URL.
  */
 fun normalizeMcpUrl(value: String): String {
-    val uri = runCatching { URI(value.trim()) }
-        .getOrElse { throw IllegalArgumentException("Invalid MCP URL: $value", it) }
+    require(value == value.trim() && value.length in 1..2_048) { "Invalid MCP URL" }
+    val uri = runCatching { URI(value) }
+        .getOrElse { throw IllegalArgumentException("Invalid MCP URL", it) }
 
     require(uri.scheme == "http" || uri.scheme == "https") {
         "MCP URL must use http or https"
     }
-    require(!uri.host.isNullOrBlank()) { "MCP URL must include a host" }
+    val host = uri.host?.removePrefix("[")?.removeSuffix("]")?.lowercase()
+    require(host == "127.0.0.1" || host == "::1") {
+        "MCP URL host must be the numeric loopback 127.0.0.1 or ::1"
+    }
+    require(uri.port == -1 || uri.port in 1..65_535) { "MCP URL port is invalid" }
+    val authorityHost = if (host == "::1") "[::1]" else host
+    val expectedAuthority = if (uri.port == -1) authorityHost else "$authorityHost:${uri.port}"
+    require(uri.rawAuthority?.lowercase() == expectedAuthority) { "MCP URL authority is not canonical" }
     require(uri.userInfo == null) { "Credentials must not be embedded in the MCP URL" }
     require(uri.query == null) { "MCP URL must not include query parameters" }
     require(uri.fragment == null) { "MCP URL must not include a fragment" }
 
-    val path = when (uri.path) {
+    val path = when (uri.rawPath) {
         null, "", "/" -> "/mcp"
-        else -> uri.path
+        "/mcp" -> "/mcp"
+        else -> throw IllegalArgumentException("MCP URL path must be /mcp")
     }
 
     return URI(
         uri.scheme,
         null,
-        uri.host,
+        host,
         uri.port,
         path,
         uri.query,
         null,
     ).toASCIIString()
+}
+
+internal fun safeProxyError(error: Throwable): String {
+    val message = error.message.orEmpty()
+        .replace(Regex("(?i)Bearer\\s+[^\\s,;]+"), "Bearer <redacted>")
+        .replace(Regex("(?i)(token|password|secret)\\s*[:=]\\s*[^\\s,;]+")) {
+            "${it.groupValues[1]}=<redacted>"
+        }
+        .replace(Regex("(?i)\\b[A-Z]:[\\\\/](?:[^\\s:;]+[\\\\/])+[^\\s:;]*"), "<path>")
+        .replace(Regex("(?<![A-Za-z0-9])/(?:[^/\\s:;]+/)+[^\\s:;]*"), "<path>")
+        .replace(Regex("[\\r\\n\\t\\u0000-\\u001f\\u007f]+"), " ")
+        .trim()
+        .take(384)
+    return if (message.isEmpty()) error::class.simpleName ?: "Exception" else message
 }
 
 fun main(args: Array<String>) {
@@ -157,7 +179,7 @@ fun main(args: Array<String>) {
             runCatching { Runtime.getRuntime().removeShutdownHook(shutdownHook) }
         }
     } catch (error: Exception) {
-        logger.error("Failed to start proxy: {}", error.message, error)
+        logger.error("Failed to start proxy: {}", safeProxyError(error))
         exitProcess(1)
     }
 }
