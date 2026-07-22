@@ -16,13 +16,16 @@ import io.modelcontextprotocol.kotlin.sdk.types.JSONRPCMessage
 import io.modelcontextprotocol.kotlin.sdk.types.JSONRPCNotification
 import io.modelcontextprotocol.kotlin.sdk.types.JSONRPCRequest
 import io.modelcontextprotocol.kotlin.sdk.types.JSONRPCResponse
+import io.modelcontextprotocol.kotlin.sdk.types.McpJson
 import io.modelcontextprotocol.kotlin.sdk.types.RPCError
 import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -35,6 +38,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.io.asSink
 import kotlinx.io.asSource
 import kotlinx.io.buffered
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import org.slf4j.LoggerFactory
 import java.io.InputStream
 import java.io.OutputStream
@@ -49,6 +54,7 @@ import kotlin.time.Duration.Companion.seconds
 
 private const val INITIALIZE_METHOD = "initialize"
 private const val INITIALIZED_METHOD = "notifications/initialized"
+private const val CANCELLED_METHOD = "notifications/cancelled"
 private const val MAX_CONCURRENT_UPSTREAM_REQUESTS = 16
 private const val REQUEST_QUEUE_CAPACITY = 64
 private const val CONTROL_QUEUE_CAPACITY = 64
@@ -100,8 +106,12 @@ internal class StreamableHttpProxy(
     private val handshakeMutex = Mutex()
     private val initialized = CompletableDeferred<Unit>()
     private val handshakeMessages = Channel<JSONRPCMessage>(HANDSHAKE_QUEUE_CAPACITY)
-    private val requestMessages = Channel<JSONRPCMessage>(requestQueueCapacity)
+    private val requestMessages = Channel<JSONRPCRequest>(requestQueueCapacity)
     private val controlMessages = Channel<JSONRPCMessage>(CONTROL_QUEUE_CAPACITY)
+    private val requestCancellationLock = Any()
+    private val knownRequestIds = HashSet<RequestId>()
+    private val inFlightRequestJobs = HashMap<RequestId, Job>()
+    private val cancelledBeforeStart = HashSet<RequestId>()
 
     init {
         require(maxConcurrentRequests > 0) { "maxConcurrentRequests must be positive" }
@@ -150,7 +160,37 @@ internal class StreamableHttpProxy(
         }
         repeat(maxConcurrentRequests) { worker ->
             scope.launch(CoroutineName("StreamableHttpProxy.requestRelay-$worker")) {
-                for (message in requestMessages) handleDownstreamMessage(message)
+                for (request in requestMessages) {
+                    val requestJob = scope.launch(
+                        context = CoroutineName("StreamableHttpProxy.upstreamRequest-${request.id}"),
+                        start = CoroutineStart.LAZY,
+                    ) {
+                        handleDownstreamMessage(request)
+                    }
+                    val cancelled = synchronized(requestCancellationLock) {
+                        if (cancelledBeforeStart.remove(request.id)) {
+                            true
+                        } else {
+                            inFlightRequestJobs[request.id] = requestJob
+                            false
+                        }
+                    }
+                    if (cancelled) {
+                        requestJob.cancel(CancellationException("MCP request was cancelled before forwarding"))
+                        synchronized(requestCancellationLock) { knownRequestIds.remove(request.id) }
+                    } else {
+                        try {
+                            requestJob.start()
+                            requestJob.join()
+                        } finally {
+                            synchronized(requestCancellationLock) {
+                                inFlightRequestJobs.remove(request.id, requestJob)
+                                knownRequestIds.remove(request.id)
+                                cancelledBeforeStart.remove(request.id)
+                            }
+                        }
+                    }
+                }
             }
         }
         scope.launch(CoroutineName("StreamableHttpProxy.controlRelay")) {
@@ -159,24 +199,52 @@ internal class StreamableHttpProxy(
     }
 
     private suspend fun enqueueDownstreamMessage(message: JSONRPCMessage) {
+        if (message is JSONRPCNotification && message.method == CANCELLED_METHOD) {
+            cancellationRequestId(message)?.let(::cancelDownstreamRequest)
+        }
         when {
             message is JSONRPCRequest && message.method == INITIALIZE_METHOD -> handshakeMessages.send(message)
             message is JSONRPCNotification && message.method == INITIALIZED_METHOD -> handshakeMessages.send(message)
             message is JSONRPCRequest -> {
-                if (requestMessages.trySend(message).isFailure && !closed.get()) {
-                    stdioTransport.send(
-                        JSONRPCError(
-                            id = message.id,
-                            error = RPCError(
-                                code = PROXY_OVERLOADED_ERROR_CODE,
-                                message = "Burp MCP proxy request queue is full; request was not forwarded",
+                val unique = synchronized(requestCancellationLock) { knownRequestIds.add(message.id) }
+                val queued = unique && requestMessages.trySend(message).isSuccess
+                if (!queued) {
+                    if (unique) synchronized(requestCancellationLock) { knownRequestIds.remove(message.id) }
+                    if (!closed.get()) {
+                        stdioTransport.send(
+                            JSONRPCError(
+                                id = message.id,
+                                error = RPCError(
+                                    code = PROXY_OVERLOADED_ERROR_CODE,
+                                    message = if (unique) {
+                                        "Burp MCP proxy request queue is full; request was not forwarded"
+                                    } else {
+                                        "Burp MCP proxy rejected a duplicate in-flight request ID; request was not forwarded"
+                                    },
+                                ),
                             ),
-                        ),
-                    )
+                        )
+                    }
                 }
             }
             else -> controlMessages.send(message)
         }
+    }
+
+    private fun cancellationRequestId(notification: JSONRPCNotification): RequestId? = runCatching {
+        val params = notification.params as? JsonObject ?: return@runCatching null
+        params["requestId"]?.let { McpJson.decodeFromJsonElement<RequestId>(it) }
+    }.getOrNull()
+
+    private fun cancelDownstreamRequest(requestId: RequestId) {
+        val activeJob = synchronized(requestCancellationLock) {
+            if (requestId !in knownRequestIds) return
+            inFlightRequestJobs[requestId] ?: run {
+                cancelledBeforeStart += requestId
+                null
+            }
+        }
+        activeJob?.cancel(CancellationException("MCP request was cancelled by the stdio client"))
     }
 
     private suspend fun handleDownstreamMessage(message: JSONRPCMessage) {

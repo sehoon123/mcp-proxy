@@ -14,17 +14,22 @@ import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration.Companion.seconds
 
 /** Raw endpoint that returns a valid but SDK-unknown custom result shape. */
 internal class RawCustomResultServer {
     private var engine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private val customCallCounter = AtomicInteger()
+    val slowCallStarted = CompletableDeferred<Unit>()
+    val cancellationRequestId = CompletableDeferred<String>()
 
     val customCallCount: Int
         get() = customCallCounter.get()
@@ -40,6 +45,12 @@ internal class RawCustomResultServer {
                     val method = request["method"]?.jsonPrimitive?.content
                     when (method) {
                         "notifications/initialized" -> call.respond(HttpStatusCode.Accepted)
+                        "notifications/cancelled" -> {
+                            val requestId = request.getValue("params").jsonObject
+                                .getValue("requestId").jsonPrimitive.content
+                            cancellationRequestId.complete(requestId)
+                            call.respond(HttpStatusCode.Accepted)
+                        }
                         "initialize" -> call.respondText(
                             buildJsonObject {
                                 put("jsonrpc", "2.0")
@@ -69,6 +80,26 @@ internal class RawCustomResultServer {
                                 ContentType.Application.Json,
                             )
                         }
+                        "custom/slow" -> {
+                            slowCallStarted.complete(Unit)
+                            delay(10.seconds)
+                            call.respondText(
+                                buildJsonObject {
+                                    put("jsonrpc", "2.0")
+                                    put("id", request.getValue("id"))
+                                    put("result", buildJsonObject { put("completed", true) })
+                                }.toString(),
+                                ContentType.Application.Json,
+                            )
+                        }
+                        "ping" -> call.respondText(
+                            buildJsonObject {
+                                put("jsonrpc", "2.0")
+                                put("id", request.getValue("id"))
+                                put("result", buildJsonObject {})
+                            }.toString(),
+                            ContentType.Application.Json,
+                        )
                         else -> call.respond(HttpStatusCode.BadRequest)
                     }
                 }

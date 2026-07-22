@@ -95,6 +95,34 @@ class StreamableHttpProxyIntegrationTest {
     }
 
     @Test
+    fun `forwards cancellation without waiting for the original request duration`() = runBlocking {
+        val server = RawCustomResultServer()
+        val port = server.start()
+        val harness = ProxyHarness("http://127.0.0.1:$port/mcp", maxConcurrentRequests = 1)
+        val peer = RawStdioPeer(harness.clientInput, harness.clientOutput)
+
+        try {
+            peer.send("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cancellation-test","version":"1.0"}}}""")
+            assertEquals("1", withTimeout(5.seconds) { peer.receive() }["id"]?.jsonPrimitive?.content)
+            peer.send("""{"jsonrpc":"2.0","method":"notifications/initialized"}""")
+            peer.send("""{"jsonrpc":"2.0","id":2,"method":"custom/slow","params":{}}""")
+            withTimeout(5.seconds) { server.slowCallStarted.await() }
+
+            peer.send("""{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"integration test"}}""")
+            assertEquals("2", withTimeout(2.seconds) { server.cancellationRequestId.await() })
+
+            // Cancellation must not kill the relay worker or invalidate the initialized session.
+            peer.send("""{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}""")
+            val ping = withTimeout(5.seconds) { peer.receive() }
+            assertEquals("3", ping["id"]?.jsonPrimitive?.content)
+        } finally {
+            peer.close()
+            harness.close()
+            server.stop()
+        }
+    }
+
+    @Test
     fun `does not retry an ambiguously delivered custom request`() = runBlocking {
         val server = RawCustomResultServer()
         val port = server.start()
