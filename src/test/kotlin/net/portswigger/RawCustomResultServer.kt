@@ -8,6 +8,7 @@ import io.ktor.server.cio.CIOApplicationEngine
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.request.receiveText
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.delete
@@ -25,21 +26,36 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
 
 /** Raw endpoint that returns a valid but SDK-unknown custom result shape. */
-internal class RawCustomResultServer {
+internal class RawCustomResultServer(
+    private val transientDeleteFailures: Int = 0,
+) {
     private var engine: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private val customCallCounter = AtomicInteger()
+    private val deleteCallCounter = AtomicInteger()
     val slowCallStarted = CompletableDeferred<Unit>()
     val cancellationRequestId = CompletableDeferred<String>()
 
     val customCallCount: Int
         get() = customCallCounter.get()
 
+    val deleteCallCount: Int
+        get() = deleteCallCounter.get()
+
     fun start(): Int {
         val port = TestMcpServer.findAvailablePort()
         engine = embeddedServer(CIO, host = "127.0.0.1", port = port) {
             routing {
                 get("/mcp") { call.respond(HttpStatusCode.MethodNotAllowed) }
-                delete("/mcp") { call.respond(HttpStatusCode.OK) }
+                delete("/mcp") {
+                    val attempt = deleteCallCounter.incrementAndGet()
+                    call.respond(
+                        if (attempt <= transientDeleteFailures) {
+                            HttpStatusCode.ServiceUnavailable
+                        } else {
+                            HttpStatusCode.OK
+                        }
+                    )
+                }
                 post("/mcp") {
                     val request = Json.parseToJsonElement(call.receiveText()).jsonObject
                     val method = request["method"]?.jsonPrimitive?.content
@@ -51,21 +67,24 @@ internal class RawCustomResultServer {
                             cancellationRequestId.complete(requestId)
                             call.respond(HttpStatusCode.Accepted)
                         }
-                        "initialize" -> call.respondText(
-                            buildJsonObject {
-                                put("jsonrpc", "2.0")
-                                put("id", request.getValue("id"))
-                                put("result", buildJsonObject {
-                                    put("protocolVersion", "2025-11-25")
-                                    put("capabilities", buildJsonObject {})
-                                    put("serverInfo", buildJsonObject {
-                                        put("name", "raw-custom-result-server")
-                                        put("version", "1.0.0")
+                        "initialize" -> {
+                            call.response.header("Mcp-Session-Id", "raw-custom-result-session")
+                            call.respondText(
+                                buildJsonObject {
+                                    put("jsonrpc", "2.0")
+                                    put("id", request.getValue("id"))
+                                    put("result", buildJsonObject {
+                                        put("protocolVersion", "2025-11-25")
+                                        put("capabilities", buildJsonObject {})
+                                        put("serverInfo", buildJsonObject {
+                                            put("name", "raw-custom-result-server")
+                                            put("version", "1.0.0")
+                                        })
                                     })
-                                })
-                            }.toString(),
-                            ContentType.Application.Json,
-                        )
+                                }.toString(),
+                                ContentType.Application.Json,
+                            )
+                        }
                         "custom/echo" -> {
                             customCallCounter.incrementAndGet()
                             call.respondText(

@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -33,6 +34,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.io.asSink
@@ -60,8 +62,12 @@ private const val REQUEST_QUEUE_CAPACITY = 64
 private const val CONTROL_QUEUE_CAPACITY = 64
 private const val HANDSHAKE_QUEUE_CAPACITY = 2
 private const val PROXY_OVERLOADED_ERROR_CODE = -32000
+private const val MAX_SESSION_TERMINATION_ATTEMPTS = 2
 private val EVENT_STREAM_WARMUP_DELAY = 250.milliseconds
+private val SESSION_TERMINATION_RETRY_DELAY = 50.milliseconds
+private val SESSION_TERMINATION_TIMEOUT = 2.seconds
 private val RETRYABLE_AVAILABILITY_STATUS_CODES = setOf(404, 408, 425, 429, 500, 502, 503, 504)
+private val RETRYABLE_TERMINATION_STATUS_CODES = setOf(408, 425, 429, 500, 502, 503, 504)
 
 internal data class RetryPolicy(
     val maxAttempts: Int = 20,
@@ -341,8 +347,9 @@ internal class StreamableHttpProxy(
                 connection = created
                 created
             } catch (error: Throwable) {
-                created.retired.set(true)
-                runCatching { created.transport.close() }
+                // A replay may already have received a fresh session ID before the initialized notification fails.
+                // It has not carried a tool call, so terminating it is safe and avoids an abandoned handshake session.
+                withContext(NonCancellable) { closeConnection(created, terminateSession = true) }
                 throw error
             }
         }
@@ -453,8 +460,43 @@ internal class StreamableHttpProxy(
         }
 
         if (shouldClose) {
-            runCatching { expected.transport.close() }
+            // A post-send failure can be execution-ambiguous. Close the local transport, but do not send DELETE and
+            // risk terminating a request that Burp may still be executing.
+            withContext(NonCancellable) { closeConnection(expected, terminateSession = false) }
         }
+    }
+
+    private suspend fun closeConnection(current: UpstreamConnection, terminateSession: Boolean) {
+        current.retired.set(true)
+        if (terminateSession && current.transport.sessionId != null) {
+            val terminated = withTimeoutOrNull(SESSION_TERMINATION_TIMEOUT) {
+                terminateSessionWithRetry(current.transport)
+            }
+            if (terminated != true) logger.debug("MCP session termination did not complete")
+        }
+        runCatching { current.transport.close() }
+    }
+
+    private suspend fun terminateSessionWithRetry(transport: StreamableHttpClientTransport): Boolean {
+        repeat(MAX_SESSION_TERMINATION_ATTEMPTS) { attempt ->
+            try {
+                transport.terminateSession()
+                return true
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                val status = error.findCause<StreamableHttpError>()?.code
+                if (status == 404) return true // The session is already absent, including after a lost DELETE response.
+                val retryable = status in RETRYABLE_TERMINATION_STATUS_CODES ||
+                    error.findCause<ConnectException>() != null
+                if (!retryable || attempt + 1 == MAX_SESSION_TERMINATION_ATTEMPTS) {
+                    logger.debug("Unable to terminate MCP session (status={})", status ?: "unavailable")
+                    return false
+                }
+                delay(SESSION_TERMINATION_RETRY_DELAY)
+            }
+        }
+        return false
     }
 
     private fun isRetryableConnectionFailure(error: Throwable): Boolean {
@@ -518,25 +560,8 @@ internal class StreamableHttpProxy(
         val current = connectionMutex.withLock {
             connection.also { connection = null }
         }
-        current?.retired?.set(true)
         current?.let {
-            if (it.transport.sessionId != null) {
-                val terminated = withTimeoutOrNull(2.seconds) {
-                    try {
-                        it.transport.terminateSession()
-                        true
-                    } catch (error: CancellationException) {
-                        throw error
-                    } catch (error: Exception) {
-                        logger.debug("Unable to terminate MCP session: {}", error.message)
-                        false
-                    }
-                }
-                if (terminated != true) {
-                    logger.debug("MCP session termination did not complete")
-                }
-            }
-            runCatching { it.transport.close() }
+            withContext(NonCancellable) { closeConnection(it, terminateSession = true) }
         }
 
         if (closeStdio) {
