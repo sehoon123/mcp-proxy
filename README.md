@@ -32,6 +32,8 @@ instead of being retried or silently altered.
 - Retries any request after send only when the server confirms the old session was not found, or the TCP connection
   was refused before delivery. Ambiguous failures are never retried, including for unknown future methods.
 - Ordinary HTTP requests have no artificial execution timeout, allowing long-running Burp operations.
+- Graceful stdio shutdown explicitly terminates the HTTP session with bounded, idempotent retry for transient DELETE
+  failures. Ambiguous in-flight request failures close locally without terminating work that Burp may still execute.
 
 ## Requirements
 

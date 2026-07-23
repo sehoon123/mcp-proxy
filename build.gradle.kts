@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "net.portswigger"
-version = "2.1.0"
+version = "2.1.1"
 
 application {
     mainClass.set("net.portswigger.MainKt")

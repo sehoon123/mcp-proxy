@@ -250,12 +250,37 @@ class StreamableHttpProxyIntegrationTest {
             assertEquals(1, server.activeSessionCount())
 
             client.close()
-            harness.close()
+            // Verify stdio EOF itself drives proxy shutdown and DELETE; the explicit harness cleanup below must not
+            // be what removes the HTTP session.
             withTimeout(5.seconds) {
                 while (server.activeSessionCount() != 0) delay(25.milliseconds)
             }
 
             assertEquals(0, server.activeSessionCount())
+        } finally {
+            runCatching { client.close() }
+            harness.close()
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `graceful stdio shutdown retries a transient session termination failure`() = runBlocking {
+        val server = RawCustomResultServer(transientDeleteFailures = 1)
+        val port = server.start()
+        val harness = ProxyHarness("http://127.0.0.1:$port/mcp")
+        val client = TestStdioMcpClient()
+
+        try {
+            withTimeout(10.seconds) { client.connectToServer(harness.clientInput, harness.clientOutput) }
+            assertEquals(Unit, client.ping().let { Unit })
+
+            client.close()
+            withTimeout(5.seconds) {
+                while (server.deleteCallCount < 2) delay(25.milliseconds)
+            }
+
+            assertEquals(2, server.deleteCallCount)
         } finally {
             runCatching { client.close() }
             harness.close()
