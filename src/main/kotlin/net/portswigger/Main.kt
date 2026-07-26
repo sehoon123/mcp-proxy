@@ -10,7 +10,7 @@ private val logger = LoggerFactory.getLogger("net.portswigger.Main")
 const val DEFAULT_MCP_URL = "http://127.0.0.1:9876/mcp"
 
 private val usage = """
-    Burp MCP stdio proxy
+    Independent MCP Bridge stdio proxy
 
     Usage:
       java -jar mcp-proxy-all.jar [--mcp-url <url>] [--bearer-token-env <name>]
@@ -163,7 +163,7 @@ fun main(args: Array<String>) {
             logger.warn("--sse-url is deprecated; using Streamable HTTP endpoint {}", config.mcpUrl)
         }
 
-        logger.info("Starting Burp MCP stdio proxy with Streamable HTTP endpoint: {}", config.mcpUrl)
+        logger.info("Starting Independent MCP Bridge stdio proxy with Streamable HTTP endpoint: {}", config.mcpUrl)
         val proxy = StreamableHttpProxy(
             mcpUrl = config.mcpUrl,
             bearerToken = config.bearerToken,

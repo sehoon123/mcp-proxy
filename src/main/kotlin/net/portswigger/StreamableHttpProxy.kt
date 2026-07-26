@@ -223,9 +223,9 @@ internal class StreamableHttpProxy(
                                 error = RPCError(
                                     code = PROXY_OVERLOADED_ERROR_CODE,
                                     message = if (unique) {
-                                        "Burp MCP proxy request queue is full; request was not forwarded"
+                                        "Independent MCP Bridge proxy request queue is full; request was not forwarded"
                                     } else {
-                                        "Burp MCP proxy rejected a duplicate in-flight request ID; request was not forwarded"
+                                        "Independent MCP Bridge proxy rejected a duplicate in-flight request ID; request was not forwarded"
                                     },
                                 ),
                             ),
@@ -329,7 +329,7 @@ internal class StreamableHttpProxy(
         }
 
         throw UpstreamUnavailableException(
-            "Burp MCP endpoint was unavailable after ${retryPolicy.maxAttempts} attempts",
+            "Independent MCP Bridge endpoint was unavailable after ${retryPolicy.maxAttempts} attempts",
             lastError,
         )
     }
@@ -540,7 +540,7 @@ internal class StreamableHttpProxy(
                     id = message.id,
                     error = RPCError(
                         code = RPCError.ErrorCode.CONNECTION_CLOSED,
-                        message = "Burp MCP endpoint unavailable: $detail",
+                        message = "Independent MCP Bridge endpoint unavailable: $detail",
                     ),
                 ),
             )

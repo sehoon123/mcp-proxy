@@ -1,9 +1,12 @@
-# MCP Proxy
+# Independent MCP Bridge stdio proxy
 
 A transparent **stdio ↔ Streamable HTTP** transport bridge for MCP.
 
-This project is the compatibility component embedded in the Burp MCP extension. End users normally install only
-`burp-mcp-all.jar`; the extension extracts this proxy when a client supports stdio but cannot connect to Streamable
+> **Unofficial independent fork:** maintained and distributed by SH Jung (`sehoon123`). It is not published, endorsed,
+> or supported by PortSwigger.
+
+This project is the compatibility component embedded in Independent MCP Bridge. End users normally install only
+`independent-mcp-bridge-all.jar`; the extension extracts this proxy when a client supports stdio but cannot connect to Streamable
 HTTP directly.
 
 ## Architecture
@@ -51,10 +54,10 @@ The executable JAR is written under `build/libs/`.
 ## Usage
 
 ```bash
-export BURP_MCP_BEARER_TOKEN='<copy the token from Burp MCP settings>'
+export INDEPENDENT_MCP_BRIDGE_BEARER_TOKEN='<copy the token from the MCP Bridge tab>'
 java -jar mcp-proxy-all.jar \
   --mcp-url http://127.0.0.1:9876/mcp \
-  --bearer-token-env BURP_MCP_BEARER_TOKEN
+  --bearer-token-env INDEPENDENT_MCP_BRIDGE_BEARER_TOKEN
 ```
 
 The default endpoint is `http://127.0.0.1:9876/mcp`, so the URL argument can usually be omitted. To prevent bearer-token

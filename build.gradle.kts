@@ -8,8 +8,8 @@ plugins {
     application
 }
 
-group = "net.portswigger"
-version = "2.1.1"
+group = "io.github.sehoon123"
+version = "2.2.0"
 
 application {
     mainClass.set("net.portswigger.MainKt")
@@ -17,6 +17,10 @@ application {
 
 repositories {
     mavenCentral()
+}
+
+dependencyLocking {
+    lockAllConfigurations()
 }
 
 dependencies {
@@ -48,17 +52,32 @@ tasks.jar {
         attributes(
             mapOf(
                 "Main-Class" to "net.portswigger.MainKt",
-                "Implementation-Title" to project.name,
+                "Implementation-Title" to "Independent MCP Bridge stdio proxy",
                 "Implementation-Version" to project.version,
-                "Implementation-Vendor" to "PortSwigger",
+                "Implementation-Vendor" to "sehoon123",
+                "Implementation-Source" to "https://github.com/sehoon123/mcp-proxy",
+                "Fork-Status" to "Unofficial independent fork; not supported by PortSwigger",
             )
         )
     }
 }
 
 tasks.shadowJar {
+    dependsOn("writeRuntimeComponents")
     archiveFileName.set("mcp-proxy-all.jar")
     mergeServiceFiles()
+    from(layout.buildDirectory.file("reports/runtime-components.txt")) {
+        into("META-INF/independent-mcp-bridge")
+    }
+    from(layout.projectDirectory.file("LICENSE")) {
+        into("META-INF/legal")
+        rename { "GPL-3.0.txt" }
+    }
+    from(layout.projectDirectory.file("NOTICE.md")) { into("META-INF/legal") }
+    from(layout.projectDirectory.file("FORK_NOTICE.md")) { into("META-INF/legal") }
+    from(layout.projectDirectory.file("THIRD_PARTY_NOTICES.md")) { into("META-INF/legal") }
+    from(layout.projectDirectory.file("CORRESPONDING_SOURCE.md")) { into("META-INF/legal") }
+    from(layout.projectDirectory.dir("legal/licenses")) { into("META-INF/legal/licenses") }
     exclude("META-INF/*.SF")
     exclude("META-INF/*.DSA")
     exclude("META-INF/*.RSA")
@@ -94,6 +113,7 @@ val writeRuntimeComponents by tasks.registering {
             }
             .distinct()
             .sorted()
+        check(lines.isNotEmpty()) { "Resolved runtime component report must not be empty" }
         val destination = outputFile.get().asFile
         destination.parentFile.mkdirs()
         destination.writeText(lines.joinToString("\n", postfix = "\n"), Charsets.UTF_8)
