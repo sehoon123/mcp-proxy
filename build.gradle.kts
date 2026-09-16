@@ -2,14 +2,14 @@ import java.security.MessageDigest
 import java.util.HexFormat
 
 plugins {
-    kotlin("jvm") version "2.3.21"
-    kotlin("plugin.serialization") version "2.3.21"
+    kotlin("jvm") version "2.4.20"
+    kotlin("plugin.serialization") version "2.4.20"
     id("com.gradleup.shadow") version "9.6.0"
     application
 }
 
 group = "io.github.sehoon123"
-version = "2.2.0"
+version = "2.2.1"
 
 application {
     mainClass.set("net.portswigger.MainKt")
